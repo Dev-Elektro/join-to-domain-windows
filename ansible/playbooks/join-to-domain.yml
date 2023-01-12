@@ -1,0 +1,353 @@
+---
+
+- name: Ввод комьютера в домен Windows
+  hosts: "{{ target }}"
+  become: true
+
+  vars_prompt:
+
+  - name: v_domain
+    prompt: Имя домена
+    private: false
+
+  - name: v_name_pc
+    prompt: Имя компьютера
+    private: false
+
+  - name: v_admin
+    prompt: Имя администратора домена
+    private: false
+
+  - name: v_pass_admin
+    prompt: Пароль администратора домена
+
+  tasks:
+  - name: Проверка доступности домена {{ v_domain }}
+    shell: realm discover {{ v_domain }} &> /dev/null
+    register: res
+    changed_when: res.rc
+
+  - name: Проверка отсутствия ПК в домене
+    shell: realm list
+    register: res
+    changed_when: false
+    failed_when: "'' != res.stdout"
+
+  - name: Проверка имени компьютера
+    shell: grep -Pq '(^(?:[a-zA-Z0-9](?:(?:[a-zA-Z0-9\-]){0,61}[a-zA-Z0-9\-])?)+[a-zA-Z0-9]$)' <<< {{ v_name_pc }}
+    register: res
+    changed_when: res.rc
+
+  - name: Проверка прохождения аутентификации и существования ПК в домене
+    shell: |
+      rm -f /tmp/join_check.txt
+      adcli show-computer -U {{ v_admin }} --domain={{ v_domain }} {{ v_name_pc }} --stdin-password <<< '{{ v_pass_admin }}' &> /tmp/join_check.txt
+      cat /tmp/join_check.txt
+    args:
+      warn: false
+    register: res
+    failed_when: ("sAMAccountName" in res.stdout) or ("Couldn't authenticate" in res.stdout)
+    changed_when: false
+
+  - name: Настройка nsswitch.conf
+    shell: |
+      v_date_time=$(date '+%d-%m-%y_%H:%M:%S')
+      cp /etc/authselect/user-nsswitch.conf /etc/authselect/user-nsswitch.conf.$v_date_time &> /dev/null
+      authselect select sssd --force &> /dev/null
+      sed -i 's/\bhosts:.*/hosts:      files dns resolve [!UNAVAIL=return] myhostname mdns4_minimal/g' /etc/authselect/user-nsswitch.conf
+      authselect apply-changes &> /dev/null
+    args:
+      warn: false
+
+  - name: Создание файла krb5.conf
+    shell: |
+      dc=$(adcli info {{ v_domain }}|grep "domain-controller ="| awk '{print $3}')
+      v_short_domen=$(cut -d'.' -f2 <<< "$dc")
+      v_short_dc=$(cut -d'.' -f1 <<< "$dc")
+      v_BIG_SHORT_DOMEN=$(tr [:lower:] [:upper:] <<< "$v_short_domen")
+      v_BIG_DOMAIN=$(tr [:lower:] [:upper:] <<< "{{ v_domain }}")
+      domainname=$(domainname -d)
+      cp /etc/krb5.conf /etc/krb5.conf.$v_date_time
+      str_pdc=" pdc "
+      str_closest=" closest "
+      str_writable=" writable "
+      string=$(adcli info {{ v_domain }} | grep "domain-controllers =" | sed s'/domain-controllers =//g')
+      IFS='  ' read -r -a array <<< "$string"
+      for i in "${array[@]}"
+      do
+        full_str=$(adcli info --domain-controller=$i | grep "domain-controller-flags =")
+        if [[ "$full_str" == *"$str_pdc"* ]]; then
+          krb5_kdc1="kdc = $i"
+          kdc1=$i
+        fi
+        if [ "$full_str" == *"$str_closest"* ] && [ "$full_str" != *"$str_pdc"* ]; then
+          krb5_kdc2="kdc = $i"
+        fi
+      done
+      echo -e 'includedir /etc/krb5.conf.d/
+
+      [logging]
+          default = FILE:/var/log/krb5libs.log
+          kdc = FILE:/var/log/krb5kdc.log
+          admin_server = FILE:/var/log/kadmind.log
+
+      [libdefaults]
+          dns_lookup_realm = false  # Отключить поиск kerberos-имени домена через DNS
+          dns_lookup_kdc = true  # Включить поиск kerberos-настроек домена через DNS
+          ticket_lifetime = 24h
+          renew_lifetime = 7d
+          forwardable = true
+          rdns = false
+          pkinit_anchors = /etc/pki/tls/certs/ca-bundle.crt
+          spake_preauth_groups = edwards25519
+          default_ccache_name = FILE:/tmp/krb5cc_%{uid}
+          default_realm = '$v_BIG_DOMAIN'
+
+          default_tgs_enctypes = aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96 RC4-HMAC DES-CBC-CRC DES3-CBC-SHA1 DES-CBC-MD5
+          default_tkt_enctypes = aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96 RC4-HMAC DES-CBC-CRC DES3-CBC-SHA1 DES-CBC-MD5
+          preferred_enctypes = aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96 RC4-HMAC DES-CBC-CRC DES3-CBC-SHA1 DES-CBC-MD5
+
+      [realms]
+          '$v_BIG_DOMAIN' = {
+          '$krb5_kdc1' # Primary Domain Controller
+          '$krb5_kdc2'
+          admin_server = '$kdc1' # Primary Domain Controller
+          default_domain = {{ v_domain }} # Domain name
+      }
+
+      [domain_realm]
+      .{{ v_domain }} = '$v_BIG_DOMAIN'
+      {{ v_domain }} = '$v_BIG_DOMAIN'
+      ' > /etc/krb5.conf
+      echo $kdc1
+    args:
+      warn: false
+    register: res
+
+  - name: Запомнить имя контролеера домена
+    set_fact: kdc1="{{ res.stdout }}"
+
+  - name: Установка необходимых пакетов
+    dnf:
+      name:
+      - realmd
+      - sssd
+      - oddjob
+      - oddjob-mkhomedir
+      - adcli
+      - samba-common
+      - samba-common-tools
+      - krb5-workstation
+      - samba-winbind-clients
+      state: latest
+      update_cache: true
+
+  - name: Изменение имени ПК на {{ v_name_pc }}
+    shell: hostnamectl set-hostname {{ v_name_pc }}.{{ v_domain }}
+    changed_when: ansible_fqdn != v_name_pc + '.' + v_domain
+
+  - name: Настройка синхронизация времени с контроллером домена
+    shell: |
+      v_date_time=$(date '+%d-%m-%y_%H-%M-%S')
+      cp /etc/chrony.conf /etc/chrony.conf.$v_date_time
+      sed -i '/server/d' /etc/chrony.conf
+      sed -i '/maxdistance/d' /etc/chrony.conf
+      echo 'server '$dc' iburst' >> /etc/chrony.conf
+    args:
+      warn: false
+
+  - name: Перезагрузка службы времени
+    systemd:
+      name: chronyd
+      state: restarted
+
+  - name: Настройка hosts
+    shell: |
+      v_date_time=$(date '+%d-%m-%y_%H-%M-%S')
+      cp /etc/hosts /etc/hosts.$v_date_time
+      echo -e '127.0.0.1 localhost localhost.localdomain localhost4 localhost4.localdomain4' > /etc/hosts
+      echo -e '::1 localhost localhost.localdomain localhost6 localhost6.localdomain6' >> /etc/hosts
+      echo -e '127.0.0.1  '$(hostname -f)' '$(hostname -s)'' >> /etc/hosts
+    args:
+      warn: false
+
+  - name: Ввод в домен {{ v_domain }}
+    shell: |
+      os_name=`cat /etc/os-release | grep ^"NAME=" | awk -F= '{print $2}' | sed 's/\"//g'`
+      os_version=`cat /etc/os-release | grep ^"VERSION_ID=" | awk -F= '{print $2}' | sed 's/\"//g'`
+      realm join -vvv -U {{ v_admin }} {{ kdc1 }} --os-name="$os_name" --os-version="$os_version" <<< "{{ v_pass_admin }}"
+    register: res
+    delay: 5
+    retries: 3
+    until: res.rc == 0
+    failed_when: res.rc != 0
+
+  - name: Создание конфига sssd.conf
+    shell: |
+      v_date_time=$(date '+%d-%m-%y_%H-%M-%S')
+      v_BIG_DOMAIN=$(tr [:lower:] [:upper:] <<< "{{ v_domain }}")
+      cp /etc/sssd/sssd.conf /etc/sssd/sssd.conf.$v_date_time
+      echo -e '[sssd]
+      domains = '$(domainname -d)'
+      config_file_version = 2
+      services = nss, pam
+
+      [domain/'$(domainname -d)']
+      ad_domain = '$(domainname -d)'
+      ad_server = {{ kdc1 }}
+      krb5_realm = '$v_BIG_DOMAIN'
+      case_sensitive = False
+      realmd_tags = manages-system joined-with-samba
+
+      # Кэширование аутентификационных данных, необходимо при недоступности домена
+      cache_credentials = True
+
+      id_provider = ad
+      access_provider = ad
+      krb5_store_password_if_offline = True
+      default_shell = /bin/bash
+      ldap_id_mapping = True
+      ad_gpo_access_control = disabled
+
+      # Включает/Отключает режим полных имён пользователей при входе
+      use_fully_qualified_names = False
+
+      # Определение домашнего каталога для доменных пользователей
+      fallback_homedir = /home/%u@%d
+
+      # Параметр access_provider = simple Определяет список доступа на основе имен пользователей или групп.
+      #access_provider = simple
+      #simple_allow_users = user1@example.com, user2@example.com
+      #simple_allow_groups = group@example.com
+
+      # Включает/Отключает перечисление всех записей домена, операция(id или getent) может занимать длительное время при enumerate = true в больших инфраструктурах
+      enumerate = false
+
+      # Параметр ignore_group_members может ускорить авторизацию в домене если домен имеет большое количество пользователей, групп и вложенных OU
+      # Если установлено значение TRUE, то атрибут членства в группе не запрашивается с сервера ldap и не обрабатывается вызовов поиска группы.
+      # ignore_group_members = True
+
+      # Поиск ссылок может привести к снижению производительности в средах, которые их интенсивно используют.
+      # true - не рекомендуется для больших инфраструктур. Отключаем этот поиск.
+      ldap_referrals = false
+
+      # Включает/Отключает динамические обновления DNS, если в статусе sssd ошибка "TSIG error with server: tsig verify failure", то установите dyndns_update = false
+      dyndns_update = true
+      dyndns_refresh_interval = 43200
+      dyndns_update_ptr = true
+      dyndns_ttl = 3600
+
+      [nss]
+      # Сколько секунд nss_sss должен кэшировать перечисления (запросы информации обо всех пользователях) Default: 120
+      #entry_cache_timeout = 15
+      # Задает время в секундах, в течение которого список поддоменов будет считаться действительным. Default: 60
+      #get_domains_timeout = 10
+      ' > /etc/sssd/sssd.conf
+    args:
+      warn: false
+
+  - name: Настройка сервиса sssd
+    shell: authconfig --enablemkhomedir --enablesssdauth --updateall
+
+  - name: Настройка limits
+    shell: |
+      v_date_time=$(date '+%d-%m-%y_%H-%M-%S')
+      cp /etc/security/limits.conf /etc/security/limits.conf.$v_date_time
+      echo -e '*     -  nofile  16384
+      root  -  nofile  16384' > /etc/security/limits.conf
+    args:
+      warn: false
+
+  - name: Настройка samba
+    shell: |
+      v_date_time=$(date '+%d-%m-%y_%H-%M-%S')
+      cp /etc/samba/smb.conf /etc/samba/smb.conf.$v_date_time
+      v_short_domen=$(cut -d'.' -f1 <<< "{{ v_domain }}")
+      v_BIG_SHORT_DOMEN=$(tr [:lower:] [:upper:] <<< "$v_short_domen")
+      v_BIG_DOMAIN=$(tr [:lower:] [:upper:] <<< "{{ v_domain }}")
+      echo -e '[global]
+          workgroup = '$v_BIG_SHORT_DOMEN'
+          realm = '$v_BIG_DOMAIN'
+          security = ADS
+          passdb backend = tdbsam
+
+          winbind enum groups = Yes
+          winbind enum users = Yes
+          winbind offline logon = Yes
+          winbind use default domain = No
+          winbind refresh tickets = Yes
+
+          idmap cache time = 900
+          idmap config * : backend = tdb
+          idmap config * : range = 10000-99999
+          idmap config '$v_BIG_SHORT_DOMEN' : backend = rid
+          idmap config '$v_BIG_SHORT_DOMEN' : range = 100000-999999
+
+          client min protocol = NT1
+          client max protocol = SMB3
+
+          dedicated keytab file = /etc/krb5.keytab
+          kerberos method = secrets and keytab
+
+          machine password timeout = 60
+          vfs objects = acl_xattr
+          map acl inherit = yes
+          store dos attributes = yes
+
+          printing = cups
+          printcap name = cups
+          load printers = yes
+          cups options = raw
+
+      [homes]
+          comment = Home Directories
+          valid users = %S, %D%w%S
+          browseable = No
+          read only = No
+          inherit acls = Yes
+
+      [printers]
+          comment = All Printers
+          path = /var/tmp
+          printable = Yes
+          create mask = 0600
+          browseable = No
+
+      [print$]
+          comment = Printer Drivers
+          path = /var/lib/samba/drivers
+          write list = @printadmin root
+          force group = @printadmin
+          create mask = 0664
+          directory mask = 0775' > /etc/samba/smb.conf
+    args:
+      warn: false
+
+  - name: Настройка pam_winbind.conf
+    shell: |
+      sed -i -e 's\;cached_login\cached_login\g' /etc/security/pam_winbind.conf
+      sed -i -e '/^cached_login/s/no/yes/g' /etc/security/pam_winbind.conf
+      sed -i -e 's\;krb5_ccache_type =\krb5_ccache_type = FILE\g' /etc/security/pam_winbind.conf
+      sed -i -e 's\;warn_pwd_expire\warn_pwd_expire\g' /etc/security/pam_winbind.conf
+      sed -i -e 's\;krb5_auth\krb5_auth\g' /etc/security/pam_winbind.conf
+      sed -i -e '/^krb5_auth/s/no/yes/g' /etc/security/pam_winbind.conf
+    args:
+      warn: false
+
+  - name: Ввод samba в домен
+    shell: net ads join -S "{{ kdc1 }}" -U "{{ v_admin }}%{{ v_pass_admin }}" -D {{ v_domain }}
+    register: res
+
+  - name: disable systemd-timesyncd
+    systemd:
+      name: systemd-timesyncd
+      state: stopped
+      enabled: no
+
+  - name: Перезагрузка компьютера
+    shell: sleep 3 && reboot now
+    async: 1
+    poll: 0
+
+  - name: Результат
+    debug: msg="Выполнено. Компьютер успешно введен в домен!"
