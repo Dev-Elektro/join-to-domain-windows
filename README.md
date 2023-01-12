@@ -1,5 +1,5 @@
 # join-to-domain-windows
-Ввод ПК в домен windows при помощи Ansible
+Ввод ПК под РЕД ОС 7.3 в домен windows при помощи Ansible
 
 ## Инструкция по использованию
 
